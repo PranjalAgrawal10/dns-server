@@ -18,10 +18,9 @@ UdpClient udpClient = new UdpClient(udpEndPoint);
 while (true)
 {
   // Receive data
-  IPEndPoint sourceEndPoint = new IPEndPoint(IPAddress.Any, 0);
   var recResult = await udpClient.ReceiveAsync();
-  var message = new DnsMessage();
-  message.Read(recResult.Buffer);
+  var (_, message) = DnsMessage.Read(recResult.Buffer);
+
   
   var response = new DnsMessage();
   response.Header = message.Header;
@@ -29,25 +28,20 @@ while (true)
   response.Header.AnswerRecordCount = 0;
   response.Header.AdditionalRecordCount = 0;
   response.Header.AuthorityRecordCount = 0;
-  Console.WriteLine($"Flag: {response.Header.Flags}");
-  Console.WriteLine($"OpCode: {response.Header.OpCode}");
   response.Header.RespCode = (byte)(response.Header.OpCode == 0 ? 0 : 4);
-  Console.WriteLine($"RespCode: {response.Header.RespCode}");
-
 
   response.Header.SetMask(DnsHeader.Masks.IsResponse);
-  response.AddQuestion(new Question
+
+  foreach (var question in message.Questions)
   {
-    Name = new DomainName("codecrafters.io"),
-    Type = 1, Class = 1
-  });
-  
-  response.AddAnswer(new ResourceRecord()
-  {
-    Name = new DomainName("codecrafters.io"), Type = 1, Class = 1, TTL = 60,
-    Data = new Memory<byte>(new byte[] { 8, 8, 8, 8 })
-  });
-  
+    response.AddQuestion(new Question { Name = question.Name, Type = 1, Class = 1 });
+    response.AddAnswer(new ResourceRecord
+    {
+      Name = question.Name, Type = 1, Class = 1, TTL = 60,
+      Data = new Memory<byte>(new byte[] { 8, 8, 8, 8 })
+    });
+  }
+
   var memory = new Memory<byte>(new byte[1024]);
   response.Header.Write(memory.Span);
   var mem2 = memory[12..];
@@ -63,9 +57,9 @@ public class DomainName
 {
   private readonly string[] _labels;
 
-  public DomainName(string domain)
+  public DomainName(string[] labels)
   {
-    _labels = domain.Split('.');
+    _labels = labels;
   }
 
   public int Write(Span<byte> buffer)
@@ -89,6 +83,23 @@ public class DomainName
     buffer[0] = (byte)bytes;
     Encoding.UTF8.GetBytes(label, buffer[1..]);
     return bytes + 1;
+  }
+
+  public static (int, DomainName) Read(ReadOnlySpan<byte> buffer)
+  {
+    var labels = new List<string>();
+    var count = 0;
+    // read until null termination
+    while (buffer[0] != 0)
+    {
+      var strLen = buffer[0];
+      var str = Encoding.UTF8.GetString(buffer.Slice(1, strLen));
+      labels.Add(str);
+      buffer = buffer[(1 + strLen)..];
+      count += 1 + strLen;
+    }
+
+    return (count + 1, new DomainName(labels.ToArray()));
   }
 }
 
@@ -135,17 +146,26 @@ public class ResourceRecord
 
 public class Question
 {
-  public DomainName Name { get; set; }
-  public ushort Type { get; set; }
-  public ushort Class { get; set; }
+  public DomainName Name { get; init; }
+  public ushort Type { get; init; }
+  public ushort Class { get; init; }
+
 
   public int Write(Span<byte> buffer)
   {
     var len = Name.Write(buffer);
     buffer = buffer[len..];
     BinaryPrimitives.WriteUInt16BigEndian(buffer, Type);
-    BinaryPrimitives.WriteUInt16BigEndian(buffer[2..], Type);
+    BinaryPrimitives.WriteUInt16BigEndian(buffer[2..], Class);
     return len + 4;
+  }
+  public static (int, Question) Read(ReadOnlySpan<byte> buffer) {
+    var (len, name) = DomainName.Read(buffer);
+    buffer = buffer[len..];
+    var type = BinaryPrimitives.ReadUInt16BigEndian(buffer);
+    var @class = BinaryPrimitives.ReadUInt16BigEndian(buffer[2..]);
+    var question = new Question { Name = name, Class = @class, Type = type };
+    return (len + 4, question);
   }
 }
 
@@ -167,9 +187,26 @@ public class DnsMessage
     Answers.Add(record);
     Header.AnswerRecordCount++;
   }
-  public int Read(ReadOnlySpan<byte> buffer) {
-    var count = Header.Read(buffer);
-    return count;
+
+  public static (int, DnsMessage) Read(ReadOnlySpan<byte> buffer)
+  {
+    var (count, header) = DnsHeader.Read(buffer);
+    var questions = new List<Question>();
+    for (int i = 0; i < header.QuestionCount; i++)
+    {
+      buffer = buffer[count..];
+      var (qCount, q) = Question.Read(buffer);
+      count += qCount;
+      questions.Add(q);
+    }
+
+    var answers = new List<ResourceRecord>();
+    var msg = new DnsMessage
+    {
+      Header = header, Questions = questions,
+      Answers = answers
+    };
+    return (count, msg);
   }
 }
 
@@ -200,19 +237,24 @@ public class DnsHeader
 
   public byte RespCode
   {
-    get => (byte)(Flags & Masks.ResponseCode);
-    set => Flags |= (ushort)(value & Masks.ResponseCode);
+    get => (byte)GetFlagValue(Masks.ResponseCode, 0);
+    set => SetFlagValue(value, Masks.ResponseCode, 0);
   }
 
   public byte OpCode
   {
-    get => (byte)((Flags & Masks.OpCode) >> Offsets.OpCode);
-    set
-    {
-      var i = (value << Offsets.OpCode);
-      var opCode = i & Masks.OpCode;
-      Flags |= (ushort)opCode;
-    }
+    get => (byte)GetFlagValue(Masks.OpCode, Offsets.OpCode);
+    set => SetFlagValue(value, Masks.OpCode, Offsets.OpCode);
+  }
+
+  private ushort GetFlagValue(ushort mask, ushort offset)
+  {
+    return (ushort)((Flags & mask) >> offset);
+  }
+
+  private void SetFlagValue(ushort value, ushort mask, ushort offset)
+  {
+    Flags |= (ushort)((value << offset) & mask);
   }
 
   public void SetFlagBool(bool value, ushort bitPosition)
@@ -252,19 +294,30 @@ public class DnsHeader
     BinaryPrimitives.WriteUInt16BigEndian(output[10..], AdditionalRecordCount);
   }
 
-  public int Read(ReadOnlySpan<byte> buffer)
+  public static (int, DnsHeader) Read(ReadOnlySpan<byte> buffer)
   {
     if (buffer.Length < 12)
     {
       throw new ArgumentException("output too short");
     }
 
-    TransactionId = BinaryPrimitives.ReadUInt16BigEndian(buffer);
-    Flags = BinaryPrimitives.ReadUInt16BigEndian(buffer[2..]);
-    QuestionCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[4..]);
-    AnswerRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[6..]);
-    AuthorityRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[8..]);
-    AdditionalRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[10..]);
-    return 12;
+    var transactionId = BinaryPrimitives.ReadUInt16BigEndian(buffer);
+    var flags = BinaryPrimitives.ReadUInt16BigEndian(buffer[2..]);
+    var questionCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[4..]);
+    var answerRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[6..]);
+    var authorityRecordCount =
+      BinaryPrimitives.ReadUInt16BigEndian(buffer[8..]);
+    var additionalRecordCount =
+      BinaryPrimitives.ReadUInt16BigEndian(buffer[10..]);
+    var header = new DnsHeader
+    {
+      TransactionId = transactionId,
+      Flags = flags,
+      QuestionCount = questionCount,
+      AnswerRecordCount = answerRecordCount,
+      AuthorityRecordCount = authorityRecordCount,
+      AdditionalRecordCount = additionalRecordCount,
+    };
+    return (12, header);
   }
 }
