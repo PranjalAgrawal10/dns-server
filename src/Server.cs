@@ -19,9 +19,9 @@ while (true)
 {
   // Receive data
   var recResult = await udpClient.ReceiveAsync();
-  var (_, message) = DnsMessage.Read(recResult.Buffer);
+  var (_, message) = DnsMessage.Read(recResult.Buffer, recResult.Buffer);
 
-  
+
   var response = new DnsMessage();
   response.Header = message.Header;
   response.Header.QuestionCount = 0;
@@ -46,10 +46,25 @@ while (true)
   response.Header.Write(memory.Span);
   var mem2 = memory[12..];
 
-  var questionLength = response.Questions[0].Write(mem2.Span);
-  mem2 = mem2[questionLength..];
-  var answerLength = response.Answers[0].Write(mem2.Span);
-  await udpClient.SendAsync(memory[..(12 + questionLength + answerLength)], recResult.RemoteEndPoint);
+  var questionLength = 0;
+  foreach (var question in response.Questions)
+  {
+    var length = question.Write(mem2.Span);
+    mem2 = mem2[length..];
+    questionLength += length;
+  }
+
+  var answerLength = 0;
+  foreach (var answer in response.Answers)
+  {
+    var length = answer.Write(mem2.Span);
+    mem2 = mem2[length..];
+    answerLength += length;
+  }
+
+  var responseMemory = memory[..(12 + questionLength + answerLength)];
+
+  await udpClient.SendAsync(responseMemory, recResult.RemoteEndPoint);
 }
 
 
@@ -85,7 +100,7 @@ public class DomainName
     return bytes + 1;
   }
 
-  public static (int, DomainName) Read(ReadOnlySpan<byte> buffer)
+  public static (int, DomainName) Read(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> completeBuffer)
   {
     var labels = new List<string>();
     var count = 0;
@@ -93,6 +108,13 @@ public class DomainName
     while (buffer[0] != 0)
     {
       var strLen = buffer[0];
+      if ((strLen & 192) == 192)
+      {
+        var ptr = BinaryPrimitives.ReadUInt16BigEndian(buffer) & 0x3FFF;
+        var (_, name) = DomainName.Read(completeBuffer[ptr..], completeBuffer);
+        return (2, name);
+      }
+
       var str = Encoding.UTF8.GetString(buffer.Slice(1, strLen));
       labels.Add(str);
       buffer = buffer[(1 + strLen)..];
@@ -142,6 +164,30 @@ public class ResourceRecord
     count += Data.Length;
     return count;
   }
+
+  public static (int aCount, ResourceRecord q)
+    Read(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> completeBuffer)
+  {
+    var count = 0;
+    var (nCount, name) = DomainName.Read(buffer, completeBuffer);
+    count += nCount;
+    var type = BinaryPrimitives.ReadUInt16BigEndian(buffer[count..]);
+    count += 2;
+    var @class = BinaryPrimitives.ReadUInt16BigEndian(buffer[count..]);
+    count += 2;
+    var ttl = BinaryPrimitives.ReadUInt32BigEndian(buffer[count..]);
+    count += 4;
+    var dataLength = BinaryPrimitives.ReadUInt16BigEndian(buffer[count..]);
+    count += 2;
+    var data = new Memory<byte>(buffer.Slice(count, dataLength).ToArray());
+    count += dataLength;
+    var record = new ResourceRecord
+    {
+      Name = name, Type = type, Class = @class,
+      TTL = ttl, Data = data
+    };
+    return (count, record);
+  }
 }
 
 public class Question
@@ -159,8 +205,10 @@ public class Question
     BinaryPrimitives.WriteUInt16BigEndian(buffer[2..], Class);
     return len + 4;
   }
-  public static (int, Question) Read(ReadOnlySpan<byte> buffer) {
-    var (len, name) = DomainName.Read(buffer);
+
+  public static (int, Question) Read(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> completeBuffer)
+  {
+    var (len, name) = DomainName.Read(buffer, completeBuffer);
     buffer = buffer[len..];
     var type = BinaryPrimitives.ReadUInt16BigEndian(buffer);
     var @class = BinaryPrimitives.ReadUInt16BigEndian(buffer[2..]);
@@ -188,19 +236,29 @@ public class DnsMessage
     Header.AnswerRecordCount++;
   }
 
-  public static (int, DnsMessage) Read(ReadOnlySpan<byte> buffer)
+  public static (int, DnsMessage) Read(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> completeBuffer)
   {
     var (count, header) = DnsHeader.Read(buffer);
+    buffer = buffer[count..];
+
     var questions = new List<Question>();
     for (int i = 0; i < header.QuestionCount; i++)
     {
-      buffer = buffer[count..];
-      var (qCount, q) = Question.Read(buffer);
+      var (qCount, q) = Question.Read(buffer, completeBuffer);
       count += qCount;
+      buffer = buffer[qCount..];
       questions.Add(q);
     }
 
     var answers = new List<ResourceRecord>();
+    for (int i = 0; i < header.AnswerRecordCount; i++)
+    {
+      var (aCount, q) = ResourceRecord.Read(buffer, completeBuffer);
+      count += aCount;
+      buffer = buffer[aCount..];
+      answers.Add(q);
+    }
+
     var msg = new DnsMessage
     {
       Header = header, Questions = questions,
