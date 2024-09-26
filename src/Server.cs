@@ -20,7 +20,21 @@ while (true)
   // Receive data
   IPEndPoint sourceEndPoint = new IPEndPoint(IPAddress.Any, 0);
   var recResult = await udpClient.ReceiveAsync();
+  var message = new DnsMessage();
+  message.Read(recResult.Buffer);
+  
   var response = new DnsMessage();
+  response.Header = message.Header;
+  response.Header.QuestionCount = 0;
+  response.Header.AnswerRecordCount = 0;
+  response.Header.AdditionalRecordCount = 0;
+  response.Header.AuthorityRecordCount = 0;
+  Console.WriteLine($"Flag: {response.Header.Flags}");
+  Console.WriteLine($"OpCode: {response.Header.OpCode}");
+  response.Header.RespCode = (byte)(response.Header.OpCode == 0 ? 0 : 4);
+  Console.WriteLine($"RespCode: {response.Header.RespCode}");
+
+
   response.Header.SetMask(DnsHeader.Masks.IsResponse);
   response.AddQuestion(new Question
   {
@@ -153,6 +167,10 @@ public class DnsMessage
     Answers.Add(record);
     Header.AnswerRecordCount++;
   }
+  public int Read(ReadOnlySpan<byte> buffer) {
+    var count = Header.Read(buffer);
+    return count;
+  }
 }
 
 public class DnsHeader
@@ -168,18 +186,33 @@ public class DnsHeader
   public static class Offsets
   {
     public const ushort IsResponse = 15;
-    public const ushort OpCode = 14;
+    public const ushort OpCode = 11;
   }
 
   public static class Masks
   {
     public const ushort IsResponse = 0x8000;
-    public const ushort OpCode = 0x7000;
+    public const ushort OpCode = 0x7800;
+    public const ushort ResponseCode = 0xF;
   }
 
-  public bool IsResponse
+  public bool IsResponse => (Flags & Masks.IsResponse) == Masks.IsResponse;
+
+  public byte RespCode
   {
-    get { return (Flags & Masks.IsResponse) == Masks.IsResponse; }
+    get => (byte)(Flags & Masks.ResponseCode);
+    set => Flags |= (ushort)(value & Masks.ResponseCode);
+  }
+
+  public byte OpCode
+  {
+    get => (byte)((Flags & Masks.OpCode) >> Offsets.OpCode);
+    set
+    {
+      var i = (value << Offsets.OpCode);
+      var opCode = i & Masks.OpCode;
+      Flags |= (ushort)opCode;
+    }
   }
 
   public void SetFlagBool(bool value, ushort bitPosition)
@@ -217,5 +250,21 @@ public class DnsHeader
     BinaryPrimitives.WriteUInt16BigEndian(output[6..], AnswerRecordCount);
     BinaryPrimitives.WriteUInt16BigEndian(output[8..], AuthorityRecordCount);
     BinaryPrimitives.WriteUInt16BigEndian(output[10..], AdditionalRecordCount);
+  }
+
+  public int Read(ReadOnlySpan<byte> buffer)
+  {
+    if (buffer.Length < 12)
+    {
+      throw new ArgumentException("output too short");
+    }
+
+    TransactionId = BinaryPrimitives.ReadUInt16BigEndian(buffer);
+    Flags = BinaryPrimitives.ReadUInt16BigEndian(buffer[2..]);
+    QuestionCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[4..]);
+    AnswerRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[6..]);
+    AuthorityRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[8..]);
+    AdditionalRecordCount = BinaryPrimitives.ReadUInt16BigEndian(buffer[10..]);
+    return 12;
   }
 }
