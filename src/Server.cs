@@ -2,13 +2,15 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-
-// string testMsg =
-// "1kOBgAABAAYAAAABBWhlbGxvBWhlbGxvBWhlbGxvA2NvbQAAAQABwAwABQABAAEy9AAPA3d3dwVoZWxsbwNjb20AwDMABQABAAAZtAAOC2hlbGxvZG90Y29twDfATgABAAEAABm0AATY7yYVwE4AAQABAAAZtAAE2O8gFcBOAAEAAQAAGbQABNjvIhXATgABAAEAABm0AATY7yQVAAApBNAAAAAAAAA=";
-// byte[] testBytes = Convert.FromBase64String(testMsg);
-// var msg = DnsMessage.Read(testBytes, testBytes);
-// You can use print statements as follows for debugging, they'll be visible
-// when running tests.
+using System.Text.Json;
+using System.Text.Json.Serialization;
+UdpClient? resolverClient = null;
+if (args.Length >= 2 && args[0] == "--resolver") {
+  Console.WriteLine($"Args: {string.Join(", ", args)}");
+  var resolverEndpoint = IPEndPoint.Parse(args[1]);
+  resolverClient =
+    new UdpClient(resolverEndpoint.Address.ToString(), resolverEndpoint.Port);
+}
 
 Console.WriteLine("Logs from your program will appear here!");
 // Uncomment this block to pass the first stage
@@ -30,6 +32,51 @@ while (true)
   Console.WriteLine($"Received: {Convert.ToBase64String(recResult.Buffer)}");
   var (_, message) = DnsMessage.Read(recResult.Buffer, recResult.Buffer);
 
+  if (resolverClient is not null)
+  {
+    var answers = new List<ResourceRecord>();
+    Console.WriteLine($"Request has {message.Questions.Count} questions");
+    foreach (var msg in message.SplitIntoSingularQuestions())
+    {
+      var splitMessage = WriteResponse(msg);
+      var options = new JsonSerializerOptions
+      {
+        WriteIndented = true, Converters = { new ReadOnlyMemoryConverter() }
+      };
+      Console.WriteLine($"Sending:\n{JsonSerializer.Serialize(msg, options)}");
+      var sentBytes = await resolverClient.SendAsync(splitMessage);
+      var resolverResponse = await resolverClient.ReceiveAsync();
+      var (_, rsp) =
+        DnsMessage.Read(resolverResponse.Buffer, resolverResponse.Buffer);
+      answers.AddRange(rsp.Answers);
+      Console.WriteLine($"Got relay response ({rsp.Answers.Count})");
+    }
+
+    Console.WriteLine($"answer count is {answers.Count}");
+    var relayResponse = new DnsMessage();
+    relayResponse.Header = message.Header;
+    relayResponse.Header.QuestionCount = 0;
+    relayResponse.Header.AnswerRecordCount = 0;
+    relayResponse.Header.AdditionalRecordCount = 0;
+    relayResponse.Header.AuthorityRecordCount = 0;
+    relayResponse.Header.RespCode =
+      (byte)(relayResponse.Header.OpCode == 0 ? 0 : 4);
+    relayResponse.Header.SetMask(DnsHeader.Masks.IsResponse);
+    foreach (var question in message.Questions)
+    {
+      relayResponse.AddQuestion(
+        new Question { Name = question.Name, Type = 1, Class = 1 });
+    }
+
+    foreach (var answer in answers)
+    {
+      relayResponse.AddAnswer(answer);
+    }
+
+    var memory = WriteResponse(relayResponse);
+    await udpClient.SendAsync(memory, recResult.RemoteEndPoint);
+    continue;
+  }
 
   var response = new DnsMessage();
   // copy client header
@@ -53,66 +100,77 @@ while (true)
     });
   }
 
-  // response.AddQuestion(new Question
-  // {
-  //     Name = new DomainName("codecrafters.io"),
-  //     Type = 1,
-  //     Class = 1
-  // });
-  // response.AddAnswer(new ResourceRecord()
-  // {
-  //     Name = new DomainName("codecrafters.io"),
-  //     Type = 1,
-  //     Class = 1,
-  //     TTL = 60,
-  //     Data = new Memory<byte>(new byte[] { 8, 8, 8, 8 })
-  // });
+  var responseMemory = WriteResponse(response);
+  Console.WriteLine($"Responding: {Convert.ToBase64String(responseMemory.Span)}");
+  await udpClient.SendAsync(responseMemory, recResult.RemoteEndPoint);
+}
+
+
+Memory<byte> WriteResponse(DnsMessage dnsMessage)
+{
   var memory = new Memory<byte>(new byte[1024]);
-  response.Header.Write(memory.Span);
+  dnsMessage.Header.Write(memory.Span);
   var mem2 = memory[12..];
 
   var questionLength = 0;
-  foreach (var question in response.Questions)
+  foreach (var question in dnsMessage.Questions)
   {
+
     var length = question.Write(mem2.Span);
     mem2 = mem2[length..];
     questionLength += length;
   }
 
   var answerLength = 0;
-  foreach (var answer in response.Answers)
+  foreach (var answer in dnsMessage.Answers)
   {
+
     var length = answer.Write(mem2.Span);
     mem2 = mem2[length..];
     answerLength += length;
   }
 
-  var responseMemory = memory[..(12 + questionLength + answerLength)];
-  Console.WriteLine(
-    $"Responding: {Convert.ToBase64String(responseMemory.Span)}");
-  await udpClient.SendAsync(responseMemory, recResult.RemoteEndPoint);
+  var responseMemory1 = memory[..(12 + questionLength + answerLength)];
+  return responseMemory1;
+}
+
+public class ReadOnlyMemoryConverter : JsonConverter<Memory<byte>>
+{
+  public override Memory<byte>
+    Read(ref Utf8JsonReader reader, Type typeToConvert,
+      JsonSerializerOptions options) => throw new NotImplementedException();
+
+  public override void Write(Utf8JsonWriter writer, Memory<byte> value,
+    JsonSerializerOptions options)
+  {
+    var str = Encoding.UTF8.GetString(value.Span);
+    writer.WriteStringValue(str);
+  }
 }
 
 
 public class DomainName
 {
-  private readonly string[] _labels;
+  public string[] Labels { get; private set; }
 
   public DomainName(string domain)
   {
-    _labels = domain.Split('.');
+    Labels = domain.Split('.');
   }
+
 
   public DomainName(string[] labels)
   {
-    _labels = labels;
+    Labels = labels;
   }
+
 
   public int Write(Span<byte> buffer)
   {
     var count = 0;
-    foreach (var label in _labels)
+    foreach (var label in Labels)
     {
+
       var bytes = WriteLabel(label, buffer);
       buffer = buffer[bytes..];
       count += bytes;
@@ -144,7 +202,8 @@ public class DomainName
       {
         var ptr = BinaryPrimitives.ReadUInt16BigEndian(buffer) & 0x3FFF;
         var (_, name) = DomainName.Read(completeBuffer[ptr..], completeBuffer);
-        return (2, name);
+        labels.AddRange(name.Labels);
+        return (count + 2, new DomainName(labels.ToArray()));
       }
 
       var str = Encoding.UTF8.GetString(buffer.Slice(1, strLen));
@@ -178,7 +237,7 @@ public class ResourceRecord
   // public ushort Length { get; set; }
   // Field	Type	Description
   //     Data (RDATA)	Variable	Data specific to the record type.
-  public Memory<byte> Data { get; set; }
+  [JsonIgnore] public Memory<byte> Data { get; set; }
 
   public int Write(Span<byte> buffer)
   {
@@ -255,6 +314,22 @@ public class DnsMessage
   public List<ResourceRecord> Answers { get; set; } = new();
 
 
+  public IEnumerable<DnsMessage> SplitIntoSingularQuestions()
+  {
+    foreach (var question in Questions)
+    {
+      var header = Header.Copy();
+      header.QuestionCount = 0;
+      header.AnswerRecordCount = 0;
+      header.AdditionalRecordCount = 0;
+      header.AuthorityRecordCount = 0;
+      var msg = new DnsMessage { Header = header };
+      msg.AddQuestion(question);
+      yield return msg;
+    }
+  }
+
+
   public void AddQuestion(Question question)
   {
     Questions.Add(question);
@@ -302,13 +377,24 @@ public class DnsMessage
 public class DnsHeader
 {
   public ushort TransactionId { get; set; } = 1234;
-
-  // TODO: Write setters for the flag fields
   public ushort Flags { get; set; }
   public ushort QuestionCount { get; set; }
   public ushort AnswerRecordCount { get; set; }
   public ushort AuthorityRecordCount { get; set; }
   public ushort AdditionalRecordCount { get; set; }
+
+  public DnsHeader Copy()
+  {
+    return new DnsHeader
+    {
+      TransactionId = TransactionId,
+      Flags = Flags,
+      QuestionCount = QuestionCount,
+      AnswerRecordCount = AnswerRecordCount,
+      AuthorityRecordCount = AuthorityRecordCount,
+      AdditionalRecordCount = AdditionalRecordCount
+    };
+  }
 
   public static class Offsets
   {
@@ -325,22 +411,12 @@ public class DnsHeader
 
   public bool IsResponse => (Flags & Masks.IsResponse) == Masks.IsResponse;
 
-  // public byte RespCode
-  // {
-  //     get => (byte)(Flags & Masks.ResponseCode);
-  //     set => Flags |= (ushort)(value & Masks.ResponseCode);
-  // }
   public byte RespCode
   {
     get => (byte)GetFlagValue(Masks.ResponseCode, 0);
     set => SetFlagValue(value, Masks.ResponseCode, 0);
   }
 
-  // public byte OpCode
-  // {
-  //     get => (byte)((Flags & Masks.OpCode) >> Offsets.OpCode);
-  //     set => Flags |= (ushort)((value << Offsets.OpCode) & Masks.OpCode);
-  // }
   public byte OpCode
   {
     get => (byte)GetFlagValue(Masks.OpCode, Offsets.OpCode);
