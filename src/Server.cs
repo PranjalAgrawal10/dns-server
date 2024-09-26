@@ -3,7 +3,16 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
+// string testMsg =
+// "1kOBgAABAAYAAAABBWhlbGxvBWhlbGxvBWhlbGxvA2NvbQAAAQABwAwABQABAAEy9AAPA3d3dwVoZWxsbwNjb20AwDMABQABAAAZtAAOC2hlbGxvZG90Y29twDfATgABAAEAABm0AATY7yYVwE4AAQABAAAZtAAE2O8gFcBOAAEAAQAAGbQABNjvIhXATgABAAEAABm0AATY7yQVAAApBNAAAAAAAAA=";
+// byte[] testBytes = Convert.FromBase64String(testMsg);
+// var msg = DnsMessage.Read(testBytes, testBytes);
+// You can use print statements as follows for debugging, they'll be visible
+// when running tests.
+
 Console.WriteLine("Logs from your program will appear here!");
+// Uncomment this block to pass the first stage
+// // Resolve UDP address
 
 IPAddress ipAddress = IPAddress.Parse("127.0.0.1");
 
@@ -14,15 +23,16 @@ IPEndPoint udpEndPoint = new IPEndPoint(ipAddress, port);
 // Create UDP socket
 UdpClient udpClient = new UdpClient(udpEndPoint);
 
-
 while (true)
 {
   // Receive data
   var recResult = await udpClient.ReceiveAsync();
+  Console.WriteLine($"Received: {Convert.ToBase64String(recResult.Buffer)}");
   var (_, message) = DnsMessage.Read(recResult.Buffer, recResult.Buffer);
 
 
   var response = new DnsMessage();
+  // copy client header
   response.Header = message.Header;
   response.Header.QuestionCount = 0;
   response.Header.AnswerRecordCount = 0;
@@ -34,7 +44,8 @@ while (true)
 
   foreach (var question in message.Questions)
   {
-    response.AddQuestion(new Question { Name = question.Name, Type = 1, Class = 1 });
+    response.AddQuestion(
+      new Question { Name = question.Name, Type = 1, Class = 1 });
     response.AddAnswer(new ResourceRecord
     {
       Name = question.Name, Type = 1, Class = 1, TTL = 60,
@@ -42,6 +53,20 @@ while (true)
     });
   }
 
+  // response.AddQuestion(new Question
+  // {
+  //     Name = new DomainName("codecrafters.io"),
+  //     Type = 1,
+  //     Class = 1
+  // });
+  // response.AddAnswer(new ResourceRecord()
+  // {
+  //     Name = new DomainName("codecrafters.io"),
+  //     Type = 1,
+  //     Class = 1,
+  //     TTL = 60,
+  //     Data = new Memory<byte>(new byte[] { 8, 8, 8, 8 })
+  // });
   var memory = new Memory<byte>(new byte[1024]);
   response.Header.Write(memory.Span);
   var mem2 = memory[12..];
@@ -63,7 +88,8 @@ while (true)
   }
 
   var responseMemory = memory[..(12 + questionLength + answerLength)];
-
+  Console.WriteLine(
+    $"Responding: {Convert.ToBase64String(responseMemory.Span)}");
   await udpClient.SendAsync(responseMemory, recResult.RemoteEndPoint);
 }
 
@@ -71,6 +97,11 @@ while (true)
 public class DomainName
 {
   private readonly string[] _labels;
+
+  public DomainName(string domain)
+  {
+    _labels = domain.Split('.');
+  }
 
   public DomainName(string[] labels)
   {
@@ -87,6 +118,7 @@ public class DomainName
       count += bytes;
     }
 
+    // add null termination
     count++;
     buffer[count] = 0;
     return count;
@@ -165,8 +197,7 @@ public class ResourceRecord
     return count;
   }
 
-  public static (int aCount, ResourceRecord q)
-    Read(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> completeBuffer)
+  public static (int aCount, ResourceRecord q) Read(ReadOnlySpan<byte> buffer, ReadOnlySpan<byte> completeBuffer)
   {
     var count = 0;
     var (nCount, name) = DomainName.Read(buffer, completeBuffer);
@@ -272,6 +303,7 @@ public class DnsHeader
 {
   public ushort TransactionId { get; set; } = 1234;
 
+  // TODO: Write setters for the flag fields
   public ushort Flags { get; set; }
   public ushort QuestionCount { get; set; }
   public ushort AnswerRecordCount { get; set; }
@@ -293,12 +325,22 @@ public class DnsHeader
 
   public bool IsResponse => (Flags & Masks.IsResponse) == Masks.IsResponse;
 
+  // public byte RespCode
+  // {
+  //     get => (byte)(Flags & Masks.ResponseCode);
+  //     set => Flags |= (ushort)(value & Masks.ResponseCode);
+  // }
   public byte RespCode
   {
     get => (byte)GetFlagValue(Masks.ResponseCode, 0);
     set => SetFlagValue(value, Masks.ResponseCode, 0);
   }
 
+  // public byte OpCode
+  // {
+  //     get => (byte)((Flags & Masks.OpCode) >> Offsets.OpCode);
+  //     set => Flags |= (ushort)((value << Offsets.OpCode) & Masks.OpCode);
+  // }
   public byte OpCode
   {
     get => (byte)GetFlagValue(Masks.OpCode, Offsets.OpCode);
