@@ -27,11 +27,21 @@ while (true)
     Name = new DomainName("codecrafters.io"),
     Type = 1, Class = 1
   });
+  
+  response.AddAnswer(new ResourceRecord()
+  {
+    Name = new DomainName("codecrafters.io"), Type = 1, Class = 1, TTL = 60,
+    Data = new Memory<byte>(new byte[] { 8, 8, 8, 8 })
+  });
+  
   var memory = new Memory<byte>(new byte[1024]);
   response.Header.Write(memory.Span);
   var mem2 = memory[12..];
+
   var questionLength = response.Questions[0].Write(mem2.Span);
-  await udpClient.SendAsync(memory[..(12 + questionLength)], recResult.RemoteEndPoint);
+  mem2 = mem2[questionLength..];
+  var answerLength = response.Answers[0].Write(mem2.Span);
+  await udpClient.SendAsync(memory[..(12 + questionLength + answerLength)], recResult.RemoteEndPoint);
 }
 
 
@@ -68,6 +78,47 @@ public class DomainName
   }
 }
 
+public class ResourceRecord
+{
+  //     Name	Label Sequence	The domain name encoded as a sequence of labels.
+  public DomainName Name { get; set; }
+
+  //     Type	2-byte Integer	1 for an A record, 5 for a CNAME record etc.,
+  //     full list here
+  public ushort Type { get; set; }
+
+  //     Class	2-byte Integer	Usually set to 1 (full list here)
+  public ushort Class { get; set; }
+
+  // TTL (Time-To-Live)	4-byte Integer	The duration in seconds a record can be
+  // cached before requerying.
+  public uint TTL { get; set; }
+
+  //     Length (RDLENGTH)	2-byte Integer	Length of the RDATA field in
+  //     bytes.
+  // public ushort Length { get; set; }
+  // Field	Type	Description
+  //     Data (RDATA)	Variable	Data specific to the record type.
+  public Memory<byte> Data { get; set; }
+
+  public int Write(Span<byte> buffer)
+  {
+    var count = 0;
+    count += Name.Write(buffer);
+    BinaryPrimitives.WriteUInt16BigEndian(buffer[count..], Type);
+    count += 2;
+    BinaryPrimitives.WriteUInt16BigEndian(buffer[count..], Class);
+    count += 2;
+    BinaryPrimitives.WriteUInt32BigEndian(buffer[count..], TTL);
+    count += 4;
+    BinaryPrimitives.WriteUInt16BigEndian(buffer[count..], (ushort)Data.Length);
+    count += 2;
+    Data.Span.CopyTo(buffer[count..]);
+    count += Data.Length;
+    return count;
+  }
+}
+
 public class Question
 {
   public DomainName Name { get; set; }
@@ -88,11 +139,19 @@ public class DnsMessage
 {
   public DnsHeader Header { get; set; } = new();
   public List<Question> Questions { get; set; } = new();
+  public List<ResourceRecord> Answers { get; set; } = new();
+
 
   public void AddQuestion(Question question)
   {
     Questions.Add(question);
     Header.QuestionCount++;
+  }
+
+  public void AddAnswer(ResourceRecord record)
+  {
+    Answers.Add(record);
+    Header.AnswerRecordCount++;
   }
 }
 
